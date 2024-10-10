@@ -4,6 +4,9 @@ use std::net::{TcpStream, TcpListener};
 use std::sync::atomic::{Ordering, AtomicUsize};
 use std::thread::{self, sleep};
 use std::time::Duration;
+use rand::rngs::OsRng;
+use rand::Rng;
+
 
 static ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -27,22 +30,26 @@ impl Event {
 }
 
 struct Client {
+    pub token: Option<String>,
     pub id: usize,
     pub address: String,
     pub stream: TcpStream,
     pub message_buffer: Vec<String>,
     pub connected: bool,
+    pub authenticated: bool,
 }
 
 impl Client {
     fn new(stream: TcpStream, address: String) -> Self {
         let unique_id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         Client {
+            token: None,
             id: unique_id,
             address,
             stream,
             message_buffer: Vec::new(),
             connected: true,
+            authenticated: false,
         }
     }
 }
@@ -50,6 +57,14 @@ impl Client {
 fn handle_client(client: Arc<Mutex<Client>>, events: Arc<Mutex<Vec<Event>>>) {
     println!("New connection from {}", client.lock().unwrap().address);
     reading_thread(client, events);
+}
+
+fn authenticate_client(client: Arc<Mutex<Client>>, message: String) -> Option<String> {
+    let guarded_client = &mut client.lock().unwrap();
+    let token = generate_session_token(32);
+    guarded_client.token = Some(token.clone());
+    guarded_client.authenticated = true;
+    Some(token)
 }
 
 fn reading_thread(client: Arc<Mutex<Client>>, events: Arc<Mutex<Vec<Event>>>) {
@@ -69,12 +84,22 @@ fn reading_thread(client: Arc<Mutex<Client>>, events: Arc<Mutex<Vec<Event>>>) {
                     }
                     Ok(bytes_read) => {
                         let message = String::from_utf8_lossy(&buffer[..bytes_read]);
-                        println!("Client {}: {}", client.lock().unwrap().id, message);
-
-                        if message == "PING" {
-                            let event = Event::new(EventType::Write(client.lock().unwrap().id, "PONG".to_string()));
-                            let guarded_events = &mut events.lock().unwrap();
-                            guarded_events.push(event);
+                        if !client.lock().unwrap().authenticated {
+                            if message.starts_with("HELLO") {
+                                println!("{}", message.to_string());
+                                if let Some(token) = authenticate_client(client.clone(), message.to_string()) {
+                                    let event = Event::new(EventType::Write(client.lock().unwrap().id, "TOKEN ".to_string() + &token));
+                                    let guarded_events = &mut events.lock().unwrap();
+                                    guarded_events.push(event);
+                                }
+                            }
+                        } else {
+                            println!("Client {}: {}", client.lock().unwrap().id, message);
+                            if message == "PING" {
+                                let event = Event::new(EventType::Write(client.lock().unwrap().id, "PONG".to_string()));
+                                let guarded_events = &mut events.lock().unwrap();
+                                guarded_events.push(event);
+                            }
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::ConnectionReset => {
@@ -92,6 +117,21 @@ fn reading_thread(client: Arc<Mutex<Client>>, events: Arc<Mutex<Vec<Event>>>) {
     });
 }
 
+fn generate_session_token(length: usize) -> String {
+    let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                           abcdefghijklmnopqrstuvwxyz\
+                           0123456789\
+                           !@#$%^&*()_-+=<>?";
+    let token: String = (0..length)
+        .map(|_| {
+            let idx = OsRng.gen_range(0..charset.len());
+            charset[idx] as char
+        })
+        .collect();
+
+    token
+}
+
 fn run_server() -> std::io::Result<()> {
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let clients: Arc<Mutex<Vec<Arc<Mutex<Client>>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -103,16 +143,17 @@ fn run_server() -> std::io::Result<()> {
         loop {
             {
                 let guarded_events = &mut cloned_events.lock().unwrap();
-                if !guarded_events.is_empty() {
-                    for event in guarded_events.drain(..) {
-                        match &event.event_type {
-                            EventType::Write(client_id, message) => {
-                                let guarded_clients = cloned_clients.lock().unwrap();
-                                for client in guarded_clients.iter() {
-                                    let guarded_client = &mut client.lock().unwrap();
-                                    if guarded_client.id == *client_id {
-                                        let _ = guarded_client.stream.write(message.as_bytes());
-                                    }
+                if guarded_events.is_empty() {
+                    continue;
+                }
+                for event in guarded_events.drain(..) {
+                    match &event.event_type {
+                        EventType::Write(client_id, message) => {
+                            let guarded_clients = cloned_clients.lock().unwrap();
+                            for client in guarded_clients.iter() {
+                                let guarded_client = &mut client.lock().unwrap();
+                                if guarded_client.id == *client_id {
+                                    let _ = guarded_client.stream.write(message.as_bytes());
                                 }
                             }
                         }
