@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
+use config::{create_auth_request_package, create_empty_package, get_package_type, unpack_auth_response_package, DataType, AUTH_RESPONSE_SIZE, AUTH_RESPONSE_VERSION, PACKET_INFO_SIZE};
 
 struct Ping {
     pub sent_at: Instant,
@@ -11,7 +12,7 @@ struct Ping {
 }
 
 impl Ping {
-    fn new(sent_at: Instant) -> Self{
+    fn new(sent_at: Instant) -> Self {
         Ping {
             sent_at,
             received_at: None,
@@ -19,7 +20,9 @@ impl Ping {
     }
 
     fn receive(&mut self) {
-        self.received_at = Some(Instant::now());
+        if self.received_at.is_none() {
+            self.received_at = Some(Instant::now());
+        }
     }
 
     fn get_duration(&self) -> Option<Duration> {
@@ -32,23 +35,23 @@ impl Ping {
 }
 
 struct Client {
-    pub token: Option<String>,
+    pub authenticated: bool,
     pub stream: TcpStream,
-    pub message_buffer: Vec<String>,
+    pub message_buffer: Vec<Vec<u8>>,
     pub connected: bool,
     pub retrying: bool,
-    pub ping: Option<Ping>,
+    pub ping: Ping,
 }
 
 impl Client {
     fn new(stream: TcpStream) -> Self {
         Client {
-            token: None,
+            authenticated: false,
             stream,
             message_buffer: Vec::new(),
             connected: false,
             retrying: false,
-            ping: None,
+            ping: Ping::new(Instant::now()),
         }
     }
 }
@@ -69,7 +72,7 @@ fn reading_thread(client: Arc<Mutex<Client>>) {
                 }
                 let is_authenticated = {
                     let guarded_client = client.lock().unwrap();
-                    guarded_client.token.is_some()
+                    guarded_client.authenticated
                 };
                 if is_connected && is_authenticated {
                     let mut stream = {
@@ -77,17 +80,27 @@ fn reading_thread(client: Arc<Mutex<Client>>) {
                         guarded_client.stream.try_clone().unwrap()
                     };
 
-                    let mut buffer = [0; 128];
+                    let mut buffer = [0; PACKET_INFO_SIZE];
                     match stream.read(&mut buffer) {
                         Ok(bytes_read) => {
-                            let server_message = String::from_utf8_lossy(&buffer[..bytes_read]);
-                            if server_message == "PONG" {
-                                if let Some(ref mut ping) = client.lock().unwrap().ping {
+                            if bytes_read != PACKET_INFO_SIZE {
+                                print!("Read bytes size: {} expected: {}", bytes_read, PACKET_INFO_SIZE);
+                                continue;
+                            }
+                            let (_version, _encoding, package_type) = get_package_type(buffer);
+                            match package_type {
+                                DataType::Ping => {
+                                    let guarded_client = &mut client.lock().unwrap();
+                                    let ping = &mut guarded_client.ping;
                                     ping.receive();
-                                    println!("Ping to server: {:?}", ping.get_duration().unwrap());
+                                    println!("Ping: {:?}", ping.get_duration().unwrap());
                                 }
-                            } else {
-                                println!("Server message: {}", server_message);
+                                DataType::Disconnect => {
+                                    println!("Disconnecting...");
+                                }
+                                unexpected_value @ _ => {
+                                    println!("Unexpected data type {:?}", unexpected_value);
+                                }
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::ConnectionReset => {
@@ -124,7 +137,7 @@ fn sending_thread(client: Arc<Mutex<Client>>) {
                     break 'outer;
                 }
                 let is_authenticated = {
-                    client.lock().unwrap().token.is_some()
+                    client.lock().unwrap().authenticated
                 };
                 if is_connected  && is_authenticated {
                     let message_to_send = {
@@ -140,12 +153,12 @@ fn sending_thread(client: Arc<Mutex<Client>>) {
                     let stream = &mut guarded_client.stream;
 
                     for message in message_to_send {
-                        let _ = stream.write(message.as_bytes());
+                        let _ = stream.write(&message);
                         let _ = stream.flush();
                     }
                 }
             }
-            sleep(Duration::from_millis(100));
+            sleep(Duration::from_millis(1));
         }
     });
 }
@@ -165,13 +178,15 @@ fn ping_server(client: Arc<Mutex<Client>>) {
                     break 'outer;
                 }
                 let is_authenticated = {
-                    client.lock().unwrap().token.is_some()
+                    client.lock().unwrap().authenticated
                 };
                 if is_connected && is_authenticated {
                     let guarded_client = &mut client.lock().unwrap();
-                    let message_buffer = &mut guarded_client.message_buffer;
-                    message_buffer.push("PING".to_string());
-                    guarded_client.ping = Some(Ping::new(Instant::now()));
+                    let send_data = create_empty_package(DataType::Ping);
+                    guarded_client.message_buffer.push(send_data.to_vec());
+                    if guarded_client.ping.received_at != None {
+                        guarded_client.ping = Ping::new(Instant::now());
+                    }
                 }
             }
             sleep(Duration::from_secs(1));
@@ -184,23 +199,52 @@ fn initialize_connection(client: Arc<Mutex<Client>>) -> bool{
         let guarded_client = client.lock().unwrap();
         guarded_client.stream.try_clone().unwrap()
     };
-    let _ = stream.write(("HELLO".to_string()).as_bytes());
+    let send_data = create_auth_request_package("username".to_string(), "password".to_string());
+    println!("{:?}", send_data);
+    let _ = stream.write(&send_data);
     let _ = stream.flush();
 
-    let mut buffer = [0; 128];
+    let mut buffer = [0u8; PACKET_INFO_SIZE];
     println!("Waiting for authentication.");
     let _ = stream.set_nonblocking(false);
     loop {
         match stream.read(&mut buffer) {
             Ok(bytes_read) => {
-                let server_message = String::from_utf8_lossy(&buffer[..bytes_read]);
-                if server_message.starts_with("TOKEN") {
-                    let token = server_message.split(" ").nth(1).unwrap().to_string();
-                    let guarded_client = &mut client.lock().unwrap();
-                    guarded_client.token = Some(token.clone());
-                    guarded_client.connected = true;
-                    println!("Authenticated with token: `{}`", &token);
-                    return true;
+                if bytes_read != PACKET_INFO_SIZE {
+                    print!("Read bytes size: {} expected: {}", bytes_read, PACKET_INFO_SIZE);
+                    continue;
+                }
+                let (version, _encoding, package_type) = get_package_type(buffer);
+                match package_type {
+                    DataType::AuthResponse if version == AUTH_RESPONSE_VERSION => {
+                        let mut response_buffer = [0u8; AUTH_RESPONSE_SIZE];
+                        match stream.read(&mut response_buffer) {
+                            Ok(response_bytes_read) => {
+                                if response_bytes_read != AUTH_RESPONSE_SIZE {
+                                    print!("Read bytes size: {} expected: {}", response_bytes_read, AUTH_RESPONSE_SIZE);
+                                    continue;
+                                }
+                                let token = unpack_auth_response_package(&response_buffer);
+                                if token == "0" {
+                                    println!("Authentication failed.");
+                                    return false;
+                                } else {
+                                    let guarded_client = &mut client.lock().unwrap();
+                                    guarded_client.authenticated = true;
+                                    guarded_client.connected = true;
+                                    println!("Authenticated!");
+                                    return true;
+                                }
+
+                            }
+                            unexpected_value @ _ => {
+                                println!("Data type unknown {:?}", unexpected_value);
+                            }
+                        }
+                    }
+                    unexpected_value @ _ => {
+                        println!("Data type unknown {:?}", unexpected_value);
+                    }
                 }
             }
             Err(_e) => {
@@ -226,11 +270,9 @@ fn client() -> std::io::Result<()> {
                 let _ = guarded_client.stream.set_nonblocking(true);
             }
             println!("Finished initialization");
-            {
-                reading_thread(client.clone());
-                ping_server(client.clone());
-                sending_thread(client.clone());
-            }
+            reading_thread(client.clone());
+            ping_server(client.clone());
+            sending_thread(client.clone());
 
             let cloned_client = client.clone();
             loop {
@@ -238,14 +280,12 @@ fn client() -> std::io::Result<()> {
                     if !cloned_client.lock().unwrap().connected {
                         println!("Reconnecting...");
                         if let Ok(new_stream) = TcpStream::connect("127.0.0.1:8080") {
-                            let mut stream = {
+                            {
                                 let guarded_client = &mut cloned_client.lock().unwrap();
                                 guarded_client.stream = new_stream;
                                 guarded_client.connected = true;
                                 guarded_client.retrying = false;
-                                guarded_client.stream.try_clone().unwrap()
-                            };
-                            let _ = stream.write("I am back!".as_bytes());
+                            }
                             println!("Reconnected!");
                             continue;
                         }
